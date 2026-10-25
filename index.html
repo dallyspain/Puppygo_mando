@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="es"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Mando PuppyGo</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;padding:10px;max-width:520px;margin:auto}
+h1{font-size:20px;margin:4px 0 8px}
+button{font-size:17px;border:0;border-radius:14px;padding:14px 6px;background:#2a2a2a;color:#fff;touch-action:manipulation}
+button:active,button.on{background:#f08a24;color:#000}
+button:disabled{opacity:.4}
+#bar{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+#connect{flex:1;background:#1e7d32;font-size:19px}
+#status{font-size:14px;padding:6px 10px;border-radius:10px;background:#333;white-space:nowrap}
+#status.ok{background:#1e7d32}#status.bad{background:#a12020}#status.wait{background:#a07000}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0;touch-action:none}
+.pad button{height:84px;font-size:30px}
+.pad .stop{background:#5a1a1a;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:8px 0}
+.grid button{height:58px}
+h2{font-size:15px;color:#aaa;margin:14px 0 4px}
+#busy{font-size:13px;color:#f0b060;min-height:18px}
+.raw{display:flex;gap:8px}
+.raw input{flex:1;font-size:17px;padding:12px;border-radius:12px;border:0;background:#222;color:#fff;font-family:monospace}
+#log{font-family:monospace;font-size:11px;background:#000;color:#9f9;height:150px;overflow:auto;padding:6px;border-radius:10px;white-space:pre-wrap;user-select:text;-webkit-user-select:text}
+label{font-size:13px;color:#aaa}
+</style></head><body>
+<h1>🐶 Mando PuppyGo</h1>
+<div id="bar"><button id="connect">Conectar</button><span id="status" class="bad">Desconectado</span></div>
+<div id="busy"></div>
+
+<h2>Mover (mantén pulsado)</h2>
+<div class="pad" id="pad">
+  <button data-d="05">↖</button><button data-d="01">⬆</button><button data-d="06">↗</button>
+  <button data-d="03">⬅</button><button class="stop" id="stopBtn">PARAR</button><button data-d="04">➡</button>
+  <button data-d="07">↙</button><button data-d="02">⬇</button><button data-d="08">↘</button>
+</div>
+
+<h2>Acciones</h2>
+<div class="grid">
+  <button data-a="0A" data-t="6000">🪑 Sentarse</button>
+  <button data-a="0B" data-t="6000">🧍 Levantarse</button>
+  <button data-a="0C" data-t="7000">🛏️ Tumbarse</button>
+  <button data-a="0D" data-t="13000">🤸 Pino</button>
+  <button data-a="0E" data-t="13000">💦 Pis</button>
+  <button data-a="0F" data-t="25000">🔄 Rodar</button>
+  <button data-a="10" data-t="8000">↺ Girar izq.</button>
+  <button data-a="11" data-t="8000">↻ Girar der.</button>
+</div>
+<label><input type="checkbox" id="lock" checked> Bloquear mientras hace una acción (como la app oficial)</label>
+
+<h2>Baile</h2>
+<div class="grid">
+  <button id="danceOn">💃 Bailar ON</button>
+  <button id="danceOff">⏹ Bailar OFF</button>
+</div>
+<div class="grid"><button id="remoteMode">Modo mando (03 F1)</button><button id="hello">Saludo (0A 01)</button></div>
+
+<h2>Bytes en hex (experimentos)</h2>
+<div class="raw"><input id="raw" placeholder="03 0A" autocomplete="off" autocapitalize="off"><button id="sendRaw">Enviar</button></div>
+
+<h2>Registro</h2>
+<div id="log"></div>
+<button id="clear" style="margin-top:6px;padding:8px 14px;font-size:14px">Borrar registro</button>
+
+<script>
+const SVC='0000ae00-0000-1000-8000-00805f9b34fb', WR='0000ae01-0000-1000-8000-00805f9b34fb', NT='0000ae02-0000-1000-8000-00805f9b34fb';
+const JOY_MS=60; // the official app repeats every 60 ms (RemoteControlView Timer.schedule(...,0,60))
+let device=null, wChar=null, nChar=null, connected=false, userDisconnect=false, retries=0, reconnectTimer=null;
+let queue=Promise.resolve(), pending=0, joyTimer=null, joyDir=null, busyUntil=0;
+const $=id=>document.getElementById(id);
+const hex=b=>Array.from(b).map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+function log(m){const t=new Date().toLocaleTimeString('es-ES',{hour12:false});const L=$('log');L.textContent+=`[${t}] ${m}\n`;if(L.textContent.length>20000)L.textContent=L.textContent.slice(-15000);L.scrollTop=L.scrollHeight;console.log(m)}
+function status(txt,cls){const s=$('status');s.textContent=txt;s.className=cls}
+function parseHex(s){const c=s.replace(/0x/gi,'').replace(/[^0-9a-f]/gi,'');if(!c.length||c.length%2)throw new Error('hex inválido');return new Uint8Array(c.match(/../g).map(h=>parseInt(h,16)))}
+
+function send(bytes,{quiet=false,skipIfBusy=false}={}){
+  const data=bytes instanceof Uint8Array?bytes:new Uint8Array(bytes);
+  if(!connected||!wChar){if(!quiet)log('✗ no conectado: '+hex(data));return Promise.resolve(false)}
+  if(skipIfBusy&&pending>1)return Promise.resolve(false); // don't let joystick repeats pile up
+  pending++;
+  queue=queue.then(async()=>{
+    try{
+      if(!wChar)return false;
+      if(wChar.properties.writeWithoutResponse)await wChar.writeValueWithoutResponse(data);else await wChar.writeValue(data);
+      if(!quiet)log('→ '+hex(data));return true;
+    }catch(e){log('✗ error al enviar '+hex(data)+': '+e.message);return false}
+    finally{pending--}
+  });
+  return queue;
+}
+
+function onNotify(e){
+  const v=e.target.value;
+  if(!v)return;
+  log('← '+hex(new Uint8Array(v.buffer,v.byteOffset,v.byteLength)));
+}
+async function setup(){
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
+  status('Conectando…','wait');
+  log('Conectando GATT con '+(device.name||device.id)+'…');
+  const server=await device.gatt.connect();
+  const svc=await server.getPrimaryService(SVC);
+  wChar=await svc.getCharacteristic(WR);
+  nChar=await svc.getCharacteristic(NT);
+  log('AE01 props: '+Object.entries(wChar.properties).filter(([k,v])=>v===true).map(([k])=>k).join(','));
+  nChar.removeEventListener('characteristicvaluechanged',onNotify);
+  nChar.addEventListener('characteristicvaluechanged',onNotify);
+  connected=true;
+  // Send the hello right away; notifications are started in parallel so the dog gets bytes ASAP
+  send([0x0A,0x01]);
+  send([0x03,0xF1]);
+  queue=queue.then(()=>nChar.startNotifications()).then(()=>log('Notificaciones AE02 activas')).catch(e=>log('✗ notificaciones: '+e.message)); // queued to avoid 'GATT operation in progress'
+  retries=0;
+  status('Conectado','ok');$('connect').textContent='Desconectar';
+}
+
+async function connect(){
+  if(!navigator.bluetooth){log('Este navegador no tiene Web Bluetooth. Usa Chrome en Android.');alert('Usa Chrome en Android (Web Bluetooth).');return}
+  try{
+    device=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'blEE'},{namePrefix:'BLEE'},{namePrefix:'tbzble'},{namePrefix:'tbz_ble'}],optionalServices:[SVC]});
+    device.addEventListener('gattserverdisconnected',onDisc);
+    userDisconnect=false;
+    await setup();
+  }catch(e){log('✗ '+e.message);if(!connected)status('Desconectado','bad')}
+}
+function onDisc(){
+  if(reconnectTimer)return;
+  connected=false;wChar=null;
+  if(nChar){nChar.removeEventListener('characteristicvaluechanged',onNotify);nChar=null}
+  stopJoy(false);
+  log('⚠ Desconectado');status('Desconectado','bad');$('connect').textContent='Conectar';
+  if(userDisconnect||!device)return;
+  if(retries>=5){log('Sin más reintentos. Pulsa Conectar.');return}
+  retries++;const d=500*retries;status('Reconectando ('+retries+')…','wait');log('Reintentando en '+d+' ms (intento '+retries+'/5)');
+  reconnectTimer=setTimeout(()=>{reconnectTimer=null;setup().catch(e=>{log('✗ reconexión: '+e.message);onDisc()})},d);
+}
+$('connect').onclick=()=>{
+  if(connected&&device){userDisconnect=true;send([0x03,0xF2]).finally(()=>device.gatt.disconnect())}
+  else if(device&&!connected){userDisconnect=false;retries=0;setup().catch(e=>{log('✗ '+e.message);connect()})}
+  else connect();
+};
+
+// Joystick
+function locked(){return $('lock').checked&&Date.now()<busyUntil}
+function startJoy(d,btn){
+  if(locked()){log('Acción en curso, espera');return}
+  stopJoy(false);joyDir=d;btn.classList.add('on');log('Mover '+d+' (cada '+JOY_MS+' ms)');
+  const b=parseInt(d,16);send([0x03,b],{quiet:true});
+  joyTimer=setInterval(()=>send([0x03,b],{quiet:true,skipIfBusy:true}),JOY_MS);
+}
+function stopJoy(sendStop=true){
+  if(joyTimer){clearInterval(joyTimer);joyTimer=null}
+  document.querySelectorAll('.pad button.on').forEach(b=>b.classList.remove('on'));
+  if(joyDir!==null&&sendStop){send([0x03,0x09])}
+  joyDir=null;
+}
+document.querySelectorAll('.pad button[data-d]').forEach(btn=>{
+  btn.addEventListener('pointerdown',e=>{e.preventDefault();btn.setPointerCapture(e.pointerId);startJoy(btn.dataset.d,btn)});
+  ['pointerup','pointercancel','lostpointercapture'].forEach(ev=>btn.addEventListener(ev,()=>{if(joyDir===btn.dataset.d)stopJoy(true)}));
+  btn.addEventListener('contextmenu',e=>e.preventDefault());
+});
+$('stopBtn').onclick=()=>{stopJoy(false);send([0x03,0x09])};
+
+// Actions
+document.querySelectorAll('button[data-a]').forEach(btn=>btn.onclick=()=>{
+  if(locked()){log('Acción en curso, espera');return}
+  stopJoy(false);
+  send([0x03,parseInt(btn.dataset.a,16)]);
+  busyUntil=Date.now()+parseInt(btn.dataset.t);
+});
+setInterval(()=>{const r=busyUntil-Date.now();$('busy').textContent=(r>0&&$('lock').checked)?'Haciendo acción… '+Math.ceil(r/1000)+' s':''},250);
+
+// Dance
+$('danceOn').onclick=async()=>{await send([0x05,0xF1]);setTimeout(()=>send([0x05,0x01]),150)};
+$('danceOff').onclick=async()=>{await send([0x05,0x02]);setTimeout(()=>send([0x03,0xF1]),150)};
+$('remoteMode').onclick=()=>send([0x03,0xF1]);
+$('hello').onclick=()=>send([0x0A,0x01]);
+
+// Raw
+$('sendRaw').onclick=()=>{try{send(parseHex($('raw').value))}catch(e){log('✗ '+e.message)}};
+$('raw').addEventListener('keydown',e=>{if(e.key==='Enter')$('sendRaw').click()});
+$('clear').onclick=()=>$('log').textContent='';
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stopJoy(true)});
+if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js',{scope:'./'}).catch(e=>log('✗ service worker: '+e.message));
+log(navigator.bluetooth?'Listo. Enciende el perro y pulsa Conectar.':'⚠ Web Bluetooth no disponible en este navegador.');
+</script>
+</body></html>
